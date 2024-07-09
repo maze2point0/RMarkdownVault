@@ -18,6 +18,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
+options(scipen=999)
 ```
 
 # Intro
@@ -337,7 +338,7 @@ summary_by_city |>
 ```
 
 `r summary_by_city[nrow(summary_by_city),]$count` grid centroids were not able to snap and therefore create a route to a city.
-This results in `r summary_by_city[nrow(summary_by_city),]$km2` km\^2 area (`summary_by_city[nrow(summary_by_city),]$count / summary_by_city$count |> sum()*100`%) and `r summary_by_city[nrow(summary_by_city),]$pop` (`summary_by_city[nrow(summary_by_city),]$pop / summary_by_city$pop |> sum()*100`%) we cannot assess the closest city for.
+This results in `r summary_by_city[nrow(summary_by_city),]$km2` km^2 area (`r (summary_by_city[nrow(summary_by_city),]$count / summary_by_city$count |> sum()*100) |> round(2)`%) and `r summary_by_city[nrow(summary_by_city),]$pop` ( `r (summary_by_city[nrow(summary_by_city),]$pop / summary_by_city$pop |> sum()*100) |> round(2)`%) we cannot assess the closest city for.
 
 What is the relation between Traveltime and population for each grid cell?
 
@@ -419,7 +420,6 @@ tm_shape(grid_final, name = 'Closest City') +
   tm_shape(cities, name = "Greater City") +
   tm_dots()
 ```
-
 
 # Output
 
