@@ -7,3 +7,6 @@ This repository bears various RMarkdown files and their rendered html version fo
 2.  [Ukraine primary healthcare access](https://maze2point0.github.io/RMarkdownVault/ukr_primary_health.html)
 
 3.  [Heidelberg cigarette vending machine locations](https://maze2point0.github.io/RMarkdownVault/cvm_heidelberg.html)
+
+4.  [Pakistan flood evacuation scenario](https://maze2point0.github.io/RMarkdownVault/pakistan_evacuation.html)
+
