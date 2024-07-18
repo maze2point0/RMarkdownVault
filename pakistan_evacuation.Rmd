@@ -34,6 +34,9 @@ knitr::knit_hooks$set(time_it = local({
     }
   }
 }))
+
+options(openrouteservice.url = "http://localhost:8080/ors")
+
 ```
 
 # Intro
@@ -79,10 +82,12 @@ library(purrr)
 library(kableExtra)
 library(mapsf)
 library(RColorBrewer)
+library(geonode4R)
 
-
-api_key <- readLines("config.txt", n = 1)
-
+config <- readLines("config.txt")
+api_key <- config[1]
+user <- config[2]
+password <- config[3]
 # Function to  adjust a list of coordinates to the location of the closest road segment via the snapping endpoint of ORS. ORS itself only allows for a maximum distance of 350m to snap.
 ors_snap <- function(x, rowids, local=F) {
   
@@ -142,7 +147,6 @@ ors_snap <- function(x, rowids, local=F) {
 
 }
 
-  
 ```
 
 # Processing pipeline
@@ -169,18 +173,58 @@ We use the following datasets as inputs:
 
 ```{r input, message=F, warning=F}
 pop <- rast('pak_ppp_2020_UNadj_constrained.tif')
-flood <- rast('1in50_resampled_100m_merged.tif')
-admin <- st_read('pak_admin3_pop.shp', quiet=T)
+admin <- st_read('pak_admin3_pop.shp', quiet = T)
+
+
 ```
 
 ## Flood preprocessing
 
-In order to join the flood data with the admin boundaries we crop and mask it to the exact boundaries of Pakistan. We change all negative values which could represent no data values to 0. That why we don't ran into aggregation problems when up cells within a grid cell or other boundary that are less than 0, NA, Inf or NaN.
+In order to join the flood data with the admin boundaries we crop and mask it to the exact boundaries of Pakistan. We change all negative values which could represent no data values to 0. That why we don't ran into aggregation problems when up cells within a grid cell or other boundary that are less than 0, NA, Inf or NaN. For our analysis we have 9 different scenarios. The scenarios are based on the combinations of
 
-```{r flood prep, message=F, warning=F}
-flood <- flood |> terra::crop(admin) 
-flood <- flood |> terra::mask(admin)
-flood[flood<0] <- 0
+**Return periods** of 5 years, 50 years and 100 years
+
+**Flood depth** of 30, 110 and 200 cm
+
+```{r flood prep, message=F, warning=F, cache=T}
+# define flood scenarios
+scenarios <- list(
+  list(returnperiod = "1in5", depths = c(30, 110, 200)),
+  list(returnperiod = "1in50", depths = c(30, 110, 200)),
+  list(returnperiod = "1in100", depths = c(30, 110, 200))
+)
+
+load_raster_data <- function(returnperiod) {
+  file_path <- paste0(returnperiod, "_resampled_100m_merged.tif")
+  rast(file_path)
+}
+
+# Process each scenario
+process_scenario <- function(raster_data, depth) {
+  scenario <- raster_data
+  scenario[scenario < depth] <- 0
+  scenario <- scenario |> terra::crop(admin) 
+  scenario <- scenario |> terra::mask(admin)
+  return(scenario)
+}
+
+# Initialize an empty list to store floods
+floods <- list()
+
+# Loop through each scenario
+for (scenario in scenarios) {
+  returnperiod <- scenario$returnperiod
+  raster_data <- load_raster_data(returnperiod)
+  
+  for (depth in scenario$depths) {
+    scenario_name <- paste0('flood_', returnperiod, "_", depth)
+    filtered_raster <- process_scenario(raster_data, depth)
+    
+    # Store the result
+    floods[[scenario_name]] <- filtered_raster
+  }
+}
+
 ```
 
 # Grid sampling
@@ -206,7 +250,18 @@ grid1km <-
                      largest = T)
 # join pop information
 grid1km$pop <- exact_extract(pop, grid1km, 'sum', progress = F)
-grid1km$flood <- exact_extract(flood, grid1km, 'max', progress = F)
+#grid1km$flood <- exact_extract(flood, grid1km, 'max', progress = F)
+extract_flood <- function(raster, grid, scenario_name) {
+  flood_values <- exact_extract(raster, grid, 'max', progress = FALSE)
+  col_name <- paste0(scenario_name, "_max")
+  grid[[col_name]] <- flood_values
+  return(grid[[col_name]])
+}
+
+scenario_names <- names(floods)
+flood_results <- map2(floods, scenario_names, ~extract_flood(.x, grid1km, .y))
+grid1km <- grid1km |> cbind(flood_results)
+
 # add rowid
 grid1km <- grid1km |> mutate(rowid = row_number())
 ```
@@ -230,7 +285,7 @@ grid1km_snapped <- grid1km |>
   mutate(centroid = st_centroid(geometry.x))
 
 # refactor names in order to keep, the grid geometry, centorid and snapped centroid
-names(grid1km_snapped)[10:11] <- c('geometry', 'snapped_centroid')
+names(grid1km_snapped)[18:19] <- c('geometry', 'snapped_centroid')
 st_geometry(grid1km_snapped) <- 'geometry'
 
 grid1km_snapped <- grid1km_snapped |> mutate(snapped = ifelse(is.na(snapped_distance), F, T)) 
@@ -247,128 +302,211 @@ grid1km_snapped |> mutate(pop=ifelse(pop<=0, F, T)) |>
   tm_shape() +
   tm_polygons(fill='pop', lwd=.1,  fill.legend = tm_legend(title='Inhabited')) + tm_place_legends_inside()
 
-grid1km_snapped |> mutate(flood=ifelse(flood<=0, F, T)) |>
+grid1km_snapped |> select(-c(admin3_teh, admin3_te0, admin3_pop, admin3_po0, admin3_po1, pop, snapped, snapped_distance, snapped, snapped_centroid, centroid)) |> 
+  pivot_longer(cols = -c(rowid,geometry), # Exclude geometry column from pivoting
+               names_to = "category", # Name of the new category column
+               values_to = "value") |> mutate(flood = ifelse(value<=0, F, T))  |> 
   tm_shape() +
-  tm_polygons(fill='flood', lwd=.1,  fill.legend = tm_legend(title='Flood affected')) + tm_place_legends_inside()
+  tm_polygons(fill='flood', lwd=.1,  fill.legend = tm_legend(title='Flood affected'), fill.free=T) + tm_place_legends_inside() |> tm_facets( by="category", nrow=3)
+
+# grid1km_snapped |> mutate(flood=ifelse(flood<=0, F, T)) |>
+#   tm_shape() +
+#   tm_polygons(fill='flood', lwd=.1,  fill.legend = tm_legend(title='Flood affected')) + tm_place_legends_inside()
 ```
 
-Out of the `r grid1km |> nrow()` cells covering Pakistan `r grid1km |> filter(pop>0) |> nrow()` are inhabited. `r grid1km |> filter(flood>0) |> nrow()` are affected by floods. 
+Out of the `r nrow(grid1km_snapped)` cells covering Pakistan `grid1km_snapped |> filter(pop>0) |> nrow()` are inhabited. 
 
-## Differentiate in origins and destinations
+```{r, include=F, echo=F, eval=F}
+grid1km_snapped |> st_drop_geometry() |> mutate(
+  flood_1in5_30 = ifelse(flood_1in5_30>0,1,0),
+  flood_1in5_110 = ifelse(flood_1in5_110>0,1,0),
+  flood_1in5_200 = ifelse(flood_1in5_200>0,1,0),
+  flood_1in50_30 = ifelse(flood_1in50_30>0,1,0),
+  flood_1in50_110 = ifelse(flood_1in50_110>0,1,0),
+  flood_1in50_200 = ifelse(flood_1in50_200>0,1,0),
+  flood_1in100_30 = ifelse(flood_1in100_30>0,1,0),
+  flood_1in100_110 = ifelse(flood_1in100_110>0,1,0),
+  flood_1in100_200 = ifelse(flood_1in100_200>0,1,0)
+) |> group_by(flood_1in5_30, flood_1in5_110, flood_1in5_200, flood_1in50_30, flood_1in50_110, flood_1in50_200, flood_1in100_30, flood_1in100_110, flood_1in100_200) |> summarise(n=n()) |> kable(latex_options='striped', caption = 'Population in flooded areas') |> suppressMessages()
+```
 
-How many of the cells we are interested in are flooded
+
+## Assess flooded and snapped locations
 
 
 ```{r differentiate in or and dest, cache=T, message=F, warning=F}
-# source points are only grids that are affected by flooding, contain population and are snapped
-source_pts <- grid1km_snapped |> filter(flood>0 & pop>0 & !is.na(snapped_distance))
 
-# destination points are all grid cells that are not affected by flooding and snap
-destination_pts <- grid1km_snapped |> filter(!is.na(snapped_distance) & (flood<= 0 | is.na(flood)))
-
-#grid1km_snapped |> tm_shape() + tm_polygons(fill='location_type', lwd=.1)
-
-grid1km_snapped |> st_drop_geometry() |> mutate(flooded = ifelse(flood <=0 | is.na(flood), T, F)) |>
+grid1km_snapped |> st_drop_geometry() |> mutate(flooded = ifelse(flood_1in5_30 <=0 | is.na(flood_1in5_30), T, F)) |>
   group_by(snapped, flooded) |> summarise(pop=sum(pop)) |> kable(latex_options='striped') |> suppressMessages()
+
+
+grid1km_snapped |> st_drop_geometry() |> filter(!is.na(snapped)) |> mutate(
+                                      flood_1in5_30 = ifelse(flood_1in5_30 <=0 | is.na(flood_1in5_30), T, F),
+                                      flood_1in5_110 = ifelse(flood_1in5_110 <=0 | is.na(flood_1in5_110), T, F),
+                                      flood_1in5_200 = ifelse(flood_1in5_200 <=0 | is.na(flood_1in5_200), T, F),
+                                      ) |>
+  group_by(snapped, 
+           flood_1in5_30, flood_1in5_110, flood_1in5_200,
+           ) |> summarise(pop=sum(pop)) |> kable(latex_options='striped', 
+                                                 caption = 'Snapped grid cells 5 years return period flood') |> suppressMessages()
+
+
+grid1km_snapped |> st_drop_geometry() |> filter(!is.na(snapped)) |> mutate(
+                                      flood_1in50_30 = ifelse(flood_1in50_30 <=0 | is.na(flood_1in50_30), T, F),
+                                      flood_1in50_110 = ifelse(flood_1in50_110 <=0 | is.na(flood_1in50_110), T, F),
+                                      flood_1in50_200 = ifelse(flood_1in50_200 <=0 | is.na(flood_1in50_200), T, F),
+                                      ) |>
+  group_by(snapped, 
+           flood_1in50_30, flood_1in50_110, flood_1in50_200,
+           ) |> summarise(pop=sum(pop)) |> kable(latex_options='striped', 
+                                                 caption = 'Snapped grid cells 50 years return period flood') |> suppressMessages()
+
+
+grid1km_snapped |> st_drop_geometry() |> filter(!is.na(snapped)) |> mutate(
+                                      flood_1in100_30 = ifelse(flood_1in100_30 <=0 | is.na(flood_1in100_30), T, F),
+                                      flood_1in100_110 = ifelse(flood_1in100_110 <=0 | is.na(flood_1in100_110), T, F),
+                                      flood_1in100_200 = ifelse(flood_1in100_200 <=0 | is.na(flood_1in100_200), T, F)
+                                      ) |>
+  group_by(snapped, 
+           flood_1in100_30, flood_1in100_110, flood_1in100_200,
+           ) |> summarise(pop=sum(pop)) |> kable(latex_options='striped', 
+                                                 caption = 'Snapped grid cells 100 years return period flood') |> suppressMessages()
+
 ```
 
 
+**How many source points do we miss due to not snapping in the 5 years period and 200cm depth?**
 
-**How many source points do we miss due to not snapping?**
+<!-- `r grid1km_snapped |> filter(flood_1in5_200>0 & pop>0 & is.na(flood_1in5_200)) |> nrow()` -->
 
-`r grid1km_snapped |> filter(flood>0 & pop>0 & is.na(snapped_distance)) |> nrow()`
+**How many source points do we miss due to not snapping in the 100 years period and 30cm depth?**
+
+<!-- `r grid1km_snapped |> filter(flood_1in100_30>0 & pop>0 & is.na(flood_1in100_30)) |> nrow()` -->
+
 
 **How many destination points?**
 
-`r grid1km_snapped |> filter(is.na(snapped_distance) &( flood<= 0 | is.na(flood))) |> nrow()`
+5 years & 200cm
+
+<!-- `r grid1km_snapped |> filter(is.na(snapped_distance) &( flood_1in5_200<= 0 | is.na(flood_1in5_200))) |> nrow()` -->
+
+100 years & 30cm
+
+<!-- `r grid1km_snapped |> filter(is.na(snapped_distance) &( flood_1in100_30<= 0 | is.na(flood_1in100_30))) |> nrow()` -->
 
 
-# Matrix request
+# O/D creation and matrix request
 
 Now we fire for each origin location a request to the ors matrix endpoint to get the 100 nearest destinations.
-We iterate over all `r nrow(source_pts)` source points.
+We iterate over all 'SOURCE POINTS' source points.
 This process is paralellized via the furrr package to speed up the process.
 
 
 ```{r matrix request, cache=T, message=F, warning=F, time_it=T}
 
-nearest_threshold <- 100
+run_scenario <- function(scenario, grid1km_snapped) {
+  
+  # source points are only grids that are affected by flooding, contain population and are snapped
+  source_pts <- grid1km_snapped |> filter(!!sym(scenario)>0 & pop>0 & !is.na(snapped_distance))
+  
+  # destination points are all grid cells that are not affected by flooding and snap
+  destination_pts <- grid1km_snapped |> filter(!is.na(snapped_distance) & (!!sym(scenario)<= 0 | is.na(!!sym(scenario))))
+  
+  nearest_threshold <- 100
 
 # Set up parallel backend using furrr
-plan(multisession, workers = 8) # Use 8 cores for parallel processing
+  plan(multisession, workers = 8) # Use 8 cores for parallel processing
+  
+  # Function to process each row
+  process_row <- function(i) {
+    
+    # Select single grid cell
+    grid1km_subset <- source_pts[i, ]
+    
+    
+    destination_pts <- destination_pts |>
+      mutate(dist = st_distance(st_centroid(destination_pts), 
+                                st_centroid(grid1km_subset)))
+    
+    # Select the top 10 rows with the lowest distance
+    next_10 <- destination_pts |>
+      arrange(dist) |>
+      slice_head(n = nearest_threshold)
+    
+    #next_10 |> mapview::mapview(next_10)
+    #next_10$geometry |> plot()
+    #grid1km_subset$geometry |> plot(add=T, col='red')
+    
+    # next_10 <- grid1km_subset |>
+    #   mutate(dist = st_distance(st_centroid(grid1km_subset), st_centroid(grid1km_notflooded_snapped_notNA))) |>
+    #   group_by(admin3_teh) |>
+    #   slice_min(dist, n = 10)
+    
+    coord_list <- map(next_10$snapped_centroid |> st_centroid(), ~ c(st_coordinates(.x)[, 1], st_coordinates(.x)[, 2]))
+    
+    source_coords <- map(grid1km_subset$snapped_centroid |> st_centroid(), ~ c(st_coordinates(.x)[, 1], st_coordinates(.x)[, 2]))
+    
+    coord_list_run <- c(source_coords, coord_list)
+    attempt <- 1
+    while(!exists('res1') && attempt <= 5) {
+      tryCatch({
+        res1 <- ors_matrix(
+        coord_list_run,
+        sources = 0,
+        metrics = c("duration", "distance"),
+        units = "km",
+        api_key = api_key,
+        output = 'parsed'
+      )
+      }, error = function(e) {
+      message("Attempt ", attempt, " failed: ", conditionMessage(e))
+      Sys.sleep(2) # Wait for 2 seconds before retrying
+    })
+    attempt <- attempt + 1
+  }
+  
+  if (!exists('res1')) {
+    stop("Failed to get a valid response after 5 attempts.")
+  }
+ 
+    
+    source_id <- grid1km_subset$rowid
+    destination_ids <- next_10$rowid
+    bird_dists <- next_10$dist
+    
+    result <- data.frame(
+      source_id = source_id,
+      destination_ids = I(list(next_10$rowid)),
+      durations = (res1$durations |> as.vector())[-1] |> as.numeric() |> list() |> I(),
+      distances = (res1$distances |> as.vector())[-1] |> as.numeric() |> list() |> I(),
+      bird_dist = bird_dists |> as.numeric() |> list() |> I(),
+      min_dist = min((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      max_dist = max((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      mean_dist = mean((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      min_dur = min((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      max_dur = max((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      mean_dur = mean((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
+      na = (res1$durations |> as.vector())[-1] |> as.numeric() |> is.na() |> sum()
+    ) |> tibble()
+    
+    names(result) <- paste0(scenario, "_", names(result))
+    
+    return(result)
+  }
+  
+  # Run the parallel processing using furrr
+  results_matrix <- future_map_dfr(1:nrow(source_pts), process_row)
+  
+  # Optionally, revert to sequential plan after the parallel work is done
+  plan(sequential)
+  
+  return(results_matrix)
 
-# Function to process each row
-process_row <- function(i) {
-  
-  # Select single grid cell
-  grid1km_subset <- source_pts[i, ]
-  
-  
-  destination_pts <- destination_pts |>
-    mutate(dist = st_distance(st_centroid(destination_pts), 
-                              st_centroid(grid1km_subset)))
-  
-  # Select the top 10 rows with the lowest distance
-  next_10 <- destination_pts |>
-    arrange(dist) |>
-    slice_head(n = nearest_threshold)
-  
-  #next_10 |> mapview::mapview(next_10)
-  #next_10$geometry |> plot()
-  #grid1km_subset$geometry |> plot(add=T, col='red')
-  
-  # next_10 <- grid1km_subset |>
-  #   mutate(dist = st_distance(st_centroid(grid1km_subset), st_centroid(grid1km_notflooded_snapped_notNA))) |>
-  #   group_by(admin3_teh) |>
-  #   slice_min(dist, n = 10)
-  
-  coord_list <- map(next_10$snapped_centroid |> st_centroid(), ~ c(st_coordinates(.x)[, 1], st_coordinates(.x)[, 2]))
-  
-  source_coords <- map(grid1km_subset$snapped_centroid |> st_centroid(), ~ c(st_coordinates(.x)[, 1], st_coordinates(.x)[, 2]))
-  
-  coord_list_run <- c(source_coords, coord_list)
-  
-  res1 <- ors_matrix(
-    coord_list_run,
-    sources = 0,
-    metrics = c("duration", "distance"),
-    units = "km",
-    api_key = api_key,
-    output = 'parsed'
-  )
-  
-  source_id <- grid1km_subset$rowid
-  destination_ids <- next_10$rowid
-  bird_dists <- next_10$dist
-  
-  result <- data.frame(
-    source_id = source_id,
-    destination_ids = I(list(next_10$rowid)),
-    durations = (res1$durations |> as.vector())[-1] |> as.numeric() |> list() |> I(),
-    distances = (res1$distances |> as.vector())[-1] |> as.numeric() |> list() |> I(),
-    bird_dist = bird_dists |> as.numeric() |> list() |> I(),
-    min_dist = min((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    max_dist = max((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    mean_dist = mean((res1$distances |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    min_dur = min((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    max_dur = max((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    mean_dur = mean((res1$durations |> as.vector())[-1] |> as.numeric(), na.rm = TRUE),
-    na = (res1$durations |> as.vector())[-1] |> as.numeric() |> is.na() |> sum()
-  ) |> tibble()
-  
-  return(result)
 }
 
-# Run the parallel processing using furrr
-results <- future_map_dfr(1:nrow(source_pts), process_row)
 
-# Combine the results into the final result matrix
-result_matrix <- results
+result_matrix <- map(scenario_names, ~run_scenario(.x, grid1km_snapped))
 
-# Optionally, revert to sequential plan after the parallel work is done
-plan(sequential)
-
-  
 #mapview::mapview(grid1km_subset, cex='red') + mapview::mapview(next_10)
 ```
 
@@ -390,50 +528,79 @@ From the functions above we get for every origin:
 Next we join the matrix result back to our grid. And do some postprocessing.
 
 ```{r postprocess}
+grid1km_snapped_joined <- NULL
+for (s in 1:length(scenario_names)) {
+    # join, convert time to hours
+    scenario <- scenario_names[s]
+    result_mtrx <- result_matrix[[s]]
+    
+  if (s==1) {
+    grid1km_snapped_joined <- grid1km_snapped |> left_join(result_mtrx, by = c('rowid' = paste0(scenario,'_','source_id'))) 
+  } else {
+    grid1km_snapped_joined <- grid1km_snapped_joined |> left_join(result_mtrx, by = c('rowid' = paste0(scenario,'_','source_id'))) 
+  }
+    column_names <- lapply(c('min_dist', 'max_dist', 'mean_dist', 'min_dur', 'max_dur', 'mean_dur'), function(x) paste0(scenario, '_', x)) |> unlist()
+  
+  
+  grid1km_snapped_joined <- grid1km_snapped_joined |>
+    mutate( across(all_of(column_names), ~ifelse(is.infinite(.), NA, .))) |> 
+    mutate(across(all_of(column_names[4:6]), ~ifelse(is.na(.), NA, ./3600)))
+}
 
-# join, convert time to hours
-grid1km_snapped_joined <- grid1km_snapped |> left_join(result_matrix, by = c('rowid' = 'source_id')) 
-grid1km_snapped_joined <- grid1km_snapped_joined |> mutate(
-  min_dist=ifelse(is.infinite(min_dist), NA, min_dist),
-  max_dist=ifelse(is.infinite(max_dist), NA, max_dist),
-  mean_dist=ifelse(is.infinite(mean_dist), NA, mean_dist),
-  min_dur=ifelse(is.infinite(min_dur), NA, min_dur),
-  max_dur=ifelse(is.infinite(max_dur), NA, max_dur),
-  mean_dur=ifelse(is.infinite(mean_dur), NA, mean_dur)
-) |> mutate(
-  min_dur = min_dur / 3600,
-  mean_dur = mean_dur / 3600,
-  max_dur = max_dur/3600
-  #durations = durations |> map(~ .x/3600),
-)
 ```
 
 
 # Results visualization
 
-## Main of minimum travel distance
+As before we focus on the best and worst case scenarios.
 
-Map of the minimum travel distance in km from each flooded & inhabited location to the next closest non flooded location.
+## Maaps of minimum travel distance
 
+Map of the minimum travel distance in km from each flooded & inhabited location to the next closest non flooded location. 
 
+### Scenario 1in5 200cm
 
-```{r viz, message=F, warning=F}
+```{r map 1in5 200, message=F, warning=F}
 
 tmap_mode('view')
 tm_shape(grid1km_snapped_joined) +
-  tm_polygons(fill='min_dist', 
+  tm_polygons(fill='flood_1in5_200_min_dist', 
+              lwd=.1, 
+              fill.legend=tm_legend(title='Travel distance in km')) 
+
+```
+
+### Scenario 1in100 30cm
+
+```{r map 1in100 30, message=F, warning=F}
+
+tm_shape(grid1km_snapped_joined) +
+  tm_polygons(fill='flood_1in100_30_min_dist', 
               lwd=.1, 
               fill.legend=tm_legend(title='Travel distance in km')) 
 
 ```
 
 
+
 ## Distribution of population x travel distance
 
-```{r viz distance, message=F, warning=F}
+### Scenario 1in5 200cm
+
+```{r viz 1in5 200, message=F, warning=F}
 
 grid1km_snapped_joined |> 
-  ggplot(aes(x = mean_dist, y = pop)) +
+  ggplot(aes(x = flood_1in5_200_mean_dist, y = pop)) +
+    geom_point() + theme_minimal() + 
+    xlab('Travel distance in km') + ylab('Population')
+```
+
+### Scenario 1in100 30cm
+
+```{r viz 1in100 30, message=F, warning=F}
+
+grid1km_snapped_joined |> 
+  ggplot(aes(x = flood_1in100_30_mean_dist, y = pop)) +
     geom_point() + theme_minimal() + 
     xlab('Travel distance in km') + ylab('Population')
 ```
@@ -441,23 +608,58 @@ grid1km_snapped_joined |>
 
 ## Distribution of population x travel time 
 
-```{r viz time, message=F, warning=F}
+
+### Scenario 1in5 200cm
+
+```{r viz time 1in5 200, message=F, warning=F}
 
 grid1km_snapped_joined |> 
-  ggplot(aes(x = min_dur, y = pop)) +
+  ggplot(aes(x = flood_1in5_200_min_dur, y = pop)) +
     geom_point() + theme_minimal() + 
     xlab('Traveltime in h') + ylab('Population')
-
 ```
+
+### Scenario 1in100 30cm
+
+```{r viz time 1in100 30, message=F, warning=F}
+
+grid1km_snapped_joined |> 
+  ggplot(aes(x = flood_1in100_30_min_dur, y = pop)) +
+    geom_point() + theme_minimal() + 
+    xlab('Traveltime in h') + ylab('Population')
+```
+
 
 ## Density of distances to nearest dry location
 
-```{r viz density, message=F, warning=F}
 
+
+### Scenario 1in5 200cm
+
+```{r viz density 1in5 200, message=F, warning=F}
 
 density <- pivot_longer(
-  grid1km_snapped_joined |> st_drop_geometry() |> select(c(rowid, min_dist, mean_dist, max_dist)), 
-  cols=c(min_dist,mean_dist,max_dist), 
+  grid1km_snapped_joined |> st_drop_geometry() |> select(c(rowid, flood_1in5_200_min_dist, flood_1in5_200_mean_dist, flood_1in5_200_max_dist)), 
+  cols=c(flood_1in5_200_min_dist,flood_1in5_200_mean_dist,flood_1in5_200_max_dist), 
+  names_to = "dist_type", values_to = "dist"
+)
+
+density |> ggplot(aes(x=dist, color=dist_type, fill=dist_type)) +
+  geom_histogram(aes(y=..density..), position="identity", alpha=0.5) +
+  geom_density(alpha=0.6) + 
+  #scale_color_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  #scale_fill_manual(values=c("#999999", "#E69F00", "#56B4E9")) +
+  labs(title='Density distances to nearest dry location',x='Time in km', y = "Density")+ xlim(c(0, 200)) +
+  theme_minimal()
+
+```
+
+### Scenario 1in100 30cm
+
+```{r viz density 1in100 30, message=F, warning=F}
+density <- pivot_longer(
+  grid1km_snapped_joined |> st_drop_geometry() |> select(c(rowid, flood_1in100_30_min_dist, flood_1in100_30_mean_dist, flood_1in100_30_max_dist)), 
+  cols=c(flood_1in100_30_min_dist,flood_1in100_30_mean_dist,flood_1in100_30_max_dist), 
   names_to = "dist_type", values_to = "dist"
 )
 
@@ -473,27 +675,41 @@ density |> ggplot(aes(x=dist, color=dist_type, fill=dist_type)) +
 
 ## Relation of minimum travel distance and duration
 
-```{r viz relation dist dur, message=F, warning=F}
 
+
+### Scenario 1in5 200cm
+
+```{r viz relation dist dur 1in5 200, message=F, warning=F}
 grid1km_snapped_joined |> 
-  ggplot(aes(x = min_dur, y = min_dist)) +
+  ggplot(aes(x = flood_1in5_200_min_dur, y = flood_1in5_200_min_dist)) +
     geom_point() + theme_minimal() + 
     xlab('Travel distance in km') + ylab('Travel time in h')
 
 ```
 
-## Aggregated to admin 3 level units
+### Scenario 1in100 30cm
+
+```{r viz relation dist dur 1in100 30, message=F, warning=F}
+grid1km_snapped_joined |> 
+  ggplot(aes(x = flood_1in100_30_min_dur, y = flood_1in100_30_min_dist)) +
+    geom_point() + theme_minimal() + 
+    xlab('Travel distance in km') + ylab('Travel time in h')
+
+```
+
+
+## Aggregated to admin units level 3 
 
 ```{r viz agg, message=F, warning=F}
 grouped_admin3 <-
   grid1km_snapped_joined |> group_by(admin3_teh, admin3_te0) |>
   summarise(
-    mean_mean_dist = mean(min_dist, na.rm = T),
-    mean_min_dist = mean(mean_dist, na.rm = T),
-    mean_min_dur = mean(mean_dur, na.rm = T),
-    mean_max_dist = mean(min_dur, na.rm = T),
-    mean_nas = mean(na, na.rm = T),
-    pop = sum(pop, na.rm = T),
+    # mean_mean_dist = mean(mean_dist, na.rm = T)
+    mean_min_dist = mean(flood_1in5_200_mean_dist, na.rm = T),
+    # mean_min_dur = mean(mean_dur, na.rm = T),
+    # mean_max_dist = mean(min_dur, na.rm = T),
+    # mean_nas = mean(na, na.rm = T),
+    # pop = sum(pop, na.rm = T),
   ) |> ungroup() |> suppressMessages()
 
 
@@ -529,9 +745,9 @@ grouped_admin3 |> ggplot(aes(x = mean_min_dist, fill=quintile)) +
   xlab('Mean travel distance in km on admin 3 level') + ylab('Count') + 
   theme_minimal()
 
-grouped_admin3 |> tm_shape() +
+tm_shape(grouped_admin3) +
   tm_polygons(
-    fill = 'mean_min_dist',
+    fill="mean_min_dist",
     lwd = .1,
     fill.scale = tm_scale_intervals(breaks = breaks),
     fill.legend = tm_legend(title = 'Mean travel distance in km')
@@ -544,7 +760,7 @@ grouped_admin3 |> tm_shape() +
 75% have a mean travel distance of up to `r quintiles[3] |> as.numeric() |> round(2)`. 
 For the last 25% (75-100%) the mean travel distance ranges from `r quintiles[3] |> as.numeric() |> round(2)` to `r quintiles[4] |> as.numeric() |> round(2)` km.
 
-```{r, message=F, warning=F, show=F, echo=F, include=F}
+```{r, message=F, warning=F, show=F, echo=F, include=F, eval=FALSE}
 
 tmap_mode('plot')
 
@@ -598,17 +814,17 @@ The red cell in the center is the source location. The blue cells are the destin
 
 # extract a single origin and its destinations
 single_or <- grid1km_snapped_joined[2555,]
-single_dest <- grid1km_snapped_joined |> filter(rowid %in% grid1km_snapped_joined[2555,]$destination_ids[[1]])
+single_dest <- grid1km_snapped_joined |> filter(rowid %in% grid1km_snapped_joined[2555,]$flood_1in100_30_destination_id[[1]])
 # re arrange accordingly
-single_dest <- single_dest[match(grid1km_snapped_joined[2555,]$destination_ids[[1]], single_dest$rowid), ]
+single_dest <- single_dest[match(grid1km_snapped_joined[2555,]$flood_1in100_30_destination_id[[1]], single_dest$rowid), ]
 # bind columns
-single_dest$durations <- single_or$durations[[1]]
-single_dest$distance <- single_or$distances[[1]]
-single_dest$bird_distance <- single_or$bird_dist[[1]]
+single_dest$flood_1in100_30_durations <- single_or$flood_1in100_30_durations[[1]]
+single_dest$flood_1in100_30_distance <- single_or$flood_1in100_30_distances[[1]]
+single_dest$flood_1in100_30_bird_distance <- single_or$flood_1in100_30_bird_dist[[1]]
 
 tmap_mode('view')
 tm_shape(single_dest) +
-  tm_polygons(fill='distance', 
+  tm_polygons(fill='flood_1in100_30_distance', 
               lwd=.1, 
               fill.legend=tm_legend(title='Travel distance in km')) +
   tm_shape(single_or) +
@@ -624,3 +840,31 @@ With the current setup we see results of travel distance from each populated and
 * Maximum snapping radius: currently 4500m
 * Number of destinations: currently 100
 * Number of parallel workers: currently 8
+
+
+# Output
+
+The desired output is a geopackage file. However our current dataframe contains a lot of list based columns. We will convert them to single strings with commas to differentiate values.
+
+```{r output, warning=F, message=F}
+
+convert_lists_to_strings <- function(df) {
+  df[] <- lapply(df, function(column) {
+    if (is.list(column) & is.na(class(column)[2] == 'sfc')) {
+      sapply(column, function(x) paste(unlist(x), collapse = ","))
+    } else {
+      column
+    }
+  })
+  st_geometry(df) <- 'geometry'
+  return(df)
+}
+
+converted_df <- convert_lists_to_strings(grid1km_snapped_joined |> select(-c(snapped_centroid, centroid)))
+converted_df[1145,]$flood_1in100_200_distances
+
+st_write(converted_df, 'pakistan_evacuation.gpkg', append=F)
+
+
+
+```
