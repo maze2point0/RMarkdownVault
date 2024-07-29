@@ -10,3 +10,5 @@ This repository bears various RMarkdown files and their rendered html version fo
 
 4.  [Pakistan flood evacuation scenario](https://maze2point0.github.io/RMarkdownVault/pakistan_evacuation.html)
 
+5. [Somalia access to markets](https://maze2point0.github.io/RMarkdownVault/somalia_foodmarkets.html)
+
