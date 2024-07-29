@@ -11,7 +11,7 @@ output:
       collapsed: true
     theme: cerulean
 editor_options: 
-  chunk_output_type: inline
+  chunk_output_type: console
   markdown: 
     wrap: sentence
 ---
@@ -62,13 +62,14 @@ library(leaflet)
 api_key <- readLines("config.txt", n = 1)
 
 # function to  adjust a list of coordinates to the location of the closest road segment via the snapping endpoint of ORS. ORS itself only allows for a maximum distance of 350m to snap.
-ors_snap <- function(x) {
+ors_snap <- function(x, rowids, local=F) {
+  
   library(httr)
   
   # Define the body
   body <- list(
     locations = x,
-    radius = 1000000 # apparently the maximum snapping distance is 5km
+    radius = 100000000 # apparently the maximum snapping distance is 5km
   )
   
   # Define the headers
@@ -78,8 +79,10 @@ ors_snap <- function(x) {
     'Content-Type' = 'application/json; charset=utf-8'
   )
   
+  endpoint <- if(local){'http://localhost:8080/ors/v2/snap/driving-car'} else {'https://api.openrouteservice.org/v2/snap/driving-car'}
   # Make the POST request
-  response <- POST('https://api.openrouteservice.org/v2/snap/driving-car', 
+  response <- POST( endpoint,
+    #'https://api.openrouteservice.org/v2/snap/driving-car', 
                    body = body, 
                    add_headers(headers), 
                    encode = "json")
@@ -106,7 +109,7 @@ ors_snap <- function(x) {
   
   # Extract data from the list and create a dataframe
   df <- do.call(rbind, lapply(seq_along(resp_content$locations), function(i) extract_data(resp_content$locations[[i]], i)))
-  
+  df$rowid <- rowids
   # Convert the dataframe to an sf object
   sf_df <- df |> 
     drop_na(lon, lat) |>  # Drop rows with NA coordinates
@@ -116,6 +119,9 @@ ors_snap <- function(x) {
   return(sf_df)
 
 }
+
+
+options(openrouteservice.url = "http://localhost:8080/ors")
 
 ```
 
@@ -151,7 +157,7 @@ We join the population information from worldpop and snap the centroids of the g
 
 # create 15km grid
 grid1km <-
-  st_make_grid(admin |> st_transform(20538), cellsize = 15000)
+  st_make_grid(admin |> st_transform(20538), cellsize = 5000, square = F, flat_topped = T)
 # convert to sf df
 grid1km <- grid1km |> st_as_sf()
 names(grid1km) <- 'geometry'
@@ -171,23 +177,14 @@ grid1km <- grid1km |> mutate(rowid = row_number())
 # add rowid for the cities too
 cities <- cities |>  mutate(rowid = row_number())
 
-# function to create a list of centroid coordinates from the grid
-grid_to_coord_list <- function(x) {
-  for (r in 1:nrow(x)) {
-    coordinates <- c(st_coordinates(st_centroid(x[r, ]))[, 1],
-                     st_coordinates(st_centroid(x[r, ]))[, 2])
-    if (r < 2) {
-      coord_list <- list(coordinates)
-    } else {
-      coord_list[[r]] <- coordinates
-    }
-  }
-  return(coord_list)
-}
-# execute  function on our grid
-coord_list <- grid_to_coord_list(grid1km)
+grid1km <- grid1km |> filter(pop>0)
+
+coord_list <-
+  lapply(grid1km$geometry |> st_centroid(), function(x)
+    c(st_coordinates(x)[, 1], st_coordinates(x)[, 2]))
+
 # put the lsit of coords to the snapping endpoint of ors
-snapped_coords <- ors_snap(coord_list)
+snapped_coords <- ors_snap(coord_list,rowids = grid1km$rowid, local = T)
 
 # Join snapped_coords to grid1km by rowid and create original centroid
 grid1km_snapped <- grid1km |>
