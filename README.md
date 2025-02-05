@@ -2,6 +2,8 @@
 
 This repository bears various RMarkdown files and their rendered html version focused on GIS-related analyses and visualizations. Each project is thematically independent, providing distinct examples geospatial data analysis and visualization.
 
+[Sketch Map Tool Numbers](https://maze2point0.github.io/RMarkdownVault/SMT_report.html)
+
 1.  [Somalia access to cities](https://maze2point0.github.io/RMarkdownVault/city_access_somalia.html)
 
 2.  [Ukraine primary healthcare access](https://maze2point0.github.io/RMarkdownVault/ukr_primary_health.html)
